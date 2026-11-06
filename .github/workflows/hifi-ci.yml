@@ -1,0 +1,49 @@
+name: fluxforge-e2e-20260902 — Deploy to EC2 via SSH
+'on':
+  push:
+    branches:
+    - main
+  workflow_dispatch: {}
+concurrency:
+  group: ec2-deployment
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    steps:
+    - uses: actions/checkout@v4
+    - name: Validate required deployment secrets
+      shell: bash
+      env:
+        EC2_HOST: ${{ secrets.EC2_HOST }}
+        EC2_PORT: ${{ secrets.EC2_PORT }}
+        EC2_USERNAME: ${{ secrets.EC2_USERNAME }}
+        EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+      run: "set -e\nfor name in EC2_HOST EC2_PORT EC2_USERNAME EC2_SSH_KEY; do\n  if [ -z \"${!name}\" ]; then\n    echo \"::error::Missing required secret: ${name}\"\n    exit 1\n  fi\ndone\necho \"SSH deployment secrets validated.\""
+    - name: Copy project to EC2
+      uses: appleboy/scp-action@v0.1.7
+      with:
+        host: ${{ secrets.EC2_HOST }}
+        port: ${{ secrets.EC2_PORT }}
+        username: ${{ secrets.EC2_USERNAME }}
+        key: ${{ secrets.EC2_SSH_KEY }}
+        source: ./
+        target: /home/${{ secrets.EC2_USERNAME }}/${{ github.event.repository.name }}
+        overwrite: 'true'
+    - name: Deploy to EC2 over SSH
+      uses: appleboy/ssh-action@v1.2.2
+      with:
+        host: ${{ secrets.EC2_HOST }}
+        port: ${{ secrets.EC2_PORT }}
+        username: ${{ secrets.EC2_USERNAME }}
+        key: ${{ secrets.EC2_SSH_KEY }}
+        script: "set -e\ntrap 'echo \"Deployment failed. Showing recent logs...\"; cd \"$APP_DIR\" 2>/dev/null || true; if docker compose version >/dev/null 2>&1; then docker compose logs --no-color --tail=200 || true; fi; exit 1' ERR\n\nREPO_NAME=\"${ github.event.repository.name }\"\nAPP_DIR=\"$HOME/$REPO_NAME\"\n\nif ! command -v docker >/dev/null 2>&1; then\n  echo \"::error::Docker is not installed on the EC2 instance.\"\n  exit 1\nfi\n\nif [ -f docker-compose.yml ] || [ -f compose.yaml ]; then\n  COMPOSE_FILE=\"$( [ -f docker-compose.yml ] && echo docker-compose.yml || echo compose.yaml )\"\n  echo \"Using Docker Compose file: $COMPOSE_FILE\"\n  docker compose -f \"$COMPOSE_FILE\" down --remove-orphans || true\n  docker compose -f \"$COMPOSE_FILE\" up -d --build\n  SERVICES=$(docker compose config --services 2>/dev/null || true)\n  if [ -n \"$SERVICES\" ]; then\n    for service in $SERVICES; do\n      if ! docker compose -f \"$COMPOSE_FILE\" ps --services | grep -Fxq \"$service\"; then\n        echo \"::error::Required service not running: $service\"\n        docker compose -f \"$COMPOSE_FILE\" logs --no-color --tail=200 || true\n        exit 1\n      fi\n    done\n  fi\nelif [ -f Dockerfile ]; then\n  echo \"Building Docker image from Dockerfile...\"\n  docker build -t \"$REPO_NAME:latest\" .\n  if docker compose version >/dev/null 2>&1; then\n    docker compose up -d --build\n  else\n    echo \"::warning::Docker Compose not available; image build completed successfully.\"\n  fi\nelse\n  echo \"::error::No Docker Compose or Dockerfile was found for deployment.\"\n  exit 1\nfi\n\necho \"Deployment succeeded.\""
